@@ -35,6 +35,8 @@ class PDFSplitterApp:
         # 状態変数
         self.pdf_path = None
         self.selected_pages = set()  # 選択されたページのインデックス（0開始）
+        self.active_pages = []        # 現在表示されているページの元のインデックス
+        self.total_pages = 0          # 開いているPDFの総ページ数
         self.page_widgets = []        # ページカード用ウィジェットのリスト
         self.photo_images = {}        # 画像のガベージコレクション防止用キャッシュ
         
@@ -76,6 +78,12 @@ class PDFSplitterApp:
         )
         self.save_btn.config(state="disabled")  # 初期状態は無効
         self.save_btn.pack(side="left", padx=5)
+        
+        self.delete_btn = self.create_flat_button(
+            self.left_btn_frame, "選択したページを削除", "#CCCCCC", "white", self.delete_selected_pages
+        )
+        self.delete_btn.config(state="disabled")  # 初期状態は無効
+        self.delete_btn.pack(side="left", padx=5)
         
         # ボタン配置用のコンテナ（右寄せ）
         self.right_btn_frame = tk.Frame(self.header_frame, bg="#FFFFFF")
@@ -266,47 +274,20 @@ class PDFSplitterApp:
             self.status_label.config(text="PDFの読み込みに失敗しました。")
             return
         
+        self.total_pages = num_pages
+        self.active_pages = list(range(num_pages))
+        
         # プレースホルダーのTk画像を用意
         tk_placeholder = ImageTk.PhotoImage(self.placeholder_image)
         self.photo_images[-1] = tk_placeholder  # キャッシュに保持
         
-        # ページカードのスケルトン(プレースホルダー)を即座に作成
-        for i in range(num_pages):
-            card_frame = tk.Frame(
-                self.scrollable_frame,
-                highlightbackground="#CCCCCC",
-                highlightcolor="#CCCCCC",
-                highlightthickness=2,
-                bd=0,
-                bg="#F5F5F5",
-                cursor="hand2"
-            )
-            
-            img_lbl = tk.Label(card_frame, image=tk_placeholder, bg="#F5F5F5")
-            img_lbl.pack(padx=8, pady=8)
-            
-            txt_lbl = tk.Label(
-                card_frame, text=f"Page {i + 1}", bg="#F5F5F5", fg="#333333", font=("Arial", 10, "bold")
-            )
-            txt_lbl.pack(padx=8, pady=(0, 8))
-            
-            # 各要素へのクリックバインド
-            for widget in (card_frame, img_lbl, txt_lbl):
-                widget.bind("<Button-1>", lambda event, idx=i: self.toggle_page_selection(idx))
-            
-            self.page_widgets.append({
-                "frame": card_frame,
-                "img_lbl": img_lbl,
-                "txt_lbl": txt_lbl
-            })
-            
-        # グリッドの再配置
-        self.update_grid_layout()
+        # ページグリッドの構築
+        self.refresh_page_grid()
         
         # コントロールボタンとステータスの更新
         self.select_all_btn.config(state="normal")
         self.clear_btn.config(state="normal")
-        self.update_save_button_state()
+        self.update_button_states()
         filename = os.path.basename(file_path)
         self.status_label.config(text=f"読込中: {filename} (全 {num_pages} ページ)")
         
@@ -355,13 +336,14 @@ class PDFSplitterApp:
                     messagebox.showerror("レンダリングエラー", f"サムネイル生成中にエラーが発生しました:\n{item[1]}")
                 else:
                     idx, img = item
-                    # 既にPDFが切り替えられている等の理由で範囲外なら無視
-                    if idx < len(self.page_widgets):
-                        tk_img = ImageTk.PhotoImage(img)
-                        self.photo_images[idx] = tk_img  # ガベージコレクション防止
-                        
-                        # ウィジェットの画像を更新
-                        self.page_widgets[idx]["img_lbl"].config(image=tk_img)
+                    tk_img = ImageTk.PhotoImage(img)
+                    self.photo_images[idx] = tk_img  # ガベージコレクション防止
+                    
+                    # ウィジェットの画像を更新
+                    for wd in self.page_widgets:
+                        if wd.get("orig_idx") == idx:
+                            wd["img_lbl"].config(image=tk_img)
+                            break
                         
                 self.queue.task_done()
         except queue.Empty:
@@ -370,53 +352,51 @@ class PDFSplitterApp:
         # ロード完了後のステータス更新
         if self.pdf_path:
             loaded_count = len(self.photo_images) - 1  # プレースホルダー分を除く
-            total_count = len(self.page_widgets)
-            filename = os.path.basename(self.pdf_path)
-            if loaded_count < total_count:
-                self.status_label.config(text=f"読込中: {filename} ({loaded_count}/{total_count} ページ完了)")
+            if loaded_count < self.total_pages:
+                filename = os.path.basename(self.pdf_path)
+                self.status_label.config(text=f"読込中: {filename} ({loaded_count}/{self.total_pages} ページ完了)")
             else:
-                self.status_label.config(
-                    text=f"選択中: {len(self.selected_pages)} / {total_count} ページ | ファイル: {filename}"
-                )
+                self.update_status_label()
                 
         # 100ms後に再確認
         self.root.after(100, self.poll_queue)
 
-    def toggle_page_selection(self, idx):
+    def toggle_page_selection(self, orig_idx):
         """ページの選択状態をトグル切り替えします"""
-        if idx in self.selected_pages:
-            self.selected_pages.remove(idx)
+        if orig_idx in self.selected_pages:
+            self.selected_pages.remove(orig_idx)
         else:
-            self.selected_pages.add(idx)
+            self.selected_pages.add(orig_idx)
             
-        self.update_card_visual(idx)
-        self.update_save_button_state()
+        self.update_card_visual(orig_idx)
+        self.update_button_states()
         self.update_status_label()
 
-    def update_card_visual(self, idx):
+    def update_card_visual(self, orig_idx):
         """対象カードのビジュアルを選択状態に応じて更新します"""
-        is_selected = idx in self.selected_pages
-        wd = self.page_widgets[idx]
-        
-        if is_selected:
-            # 選択時：赤枠、薄い赤の背景、赤いフォント
-            wd["frame"].config(highlightbackground="#FF3B30", highlightcolor="#FF3B30", bg="#FFEAEA")
-            wd["img_lbl"].config(bg="#FFEAEA")
-            wd["txt_lbl"].config(bg="#FFEAEA", fg="#FF3B30")
-        else:
-            # 未選択時：グレー枠、ライトグレーの背景、グレーのフォント
-            wd["frame"].config(highlightbackground="#CCCCCC", highlightcolor="#CCCCCC", bg="#F5F5F5")
-            wd["img_lbl"].config(bg="#F5F5F5")
-            wd["txt_lbl"].config(bg="#F5F5F5", fg="#333333")
+        is_selected = orig_idx in self.selected_pages
+        for wd in self.page_widgets:
+            if wd.get("orig_idx") == orig_idx:
+                if is_selected:
+                    # 選択時：赤枠、薄い赤の背景、赤いフォント
+                    wd["frame"].config(highlightbackground="#FF3B30", highlightcolor="#FF3B30", bg="#FFEAEA")
+                    wd["img_lbl"].config(bg="#FFEAEA")
+                    wd["txt_lbl"].config(bg="#FFEAEA", fg="#FF3B30")
+                else:
+                    # 未選択時：グレー枠、ライトグレーの背景、グレーのフォント
+                    wd["frame"].config(highlightbackground="#CCCCCC", highlightcolor="#CCCCCC", bg="#F5F5F5")
+                    wd["img_lbl"].config(bg="#F5F5F5")
+                    wd["txt_lbl"].config(bg="#F5F5F5", fg="#333333")
+                break
 
     def select_all(self):
         """すべてのページを選択します"""
         if not self.pdf_path:
             return
-        for i in range(len(self.page_widgets)):
-            self.selected_pages.add(i)
-            self.update_card_visual(i)
-        self.update_save_button_state()
+        for orig_idx in self.active_pages:
+            self.selected_pages.add(orig_idx)
+            self.update_card_visual(orig_idx)
+        self.update_button_states()
         self.update_status_label()
 
     def clear_selection(self):
@@ -424,17 +404,89 @@ class PDFSplitterApp:
         if not self.pdf_path:
             return
         self.selected_pages.clear()
-        for i in range(len(self.page_widgets)):
-            self.update_card_visual(i)
-        self.update_save_button_state()
+        for orig_idx in self.active_pages:
+            self.update_card_visual(orig_idx)
+        self.update_button_states()
         self.update_status_label()
 
-    def update_save_button_state(self):
-        """選択されているページ数に応じて保存ボタンのアクティブ状態とカラーを制御します"""
+    def update_button_states(self):
+        """選択されているページ数に応じて保存ボタンと削除ボタンのアクティブ状態とカラーを制御します"""
         if self.selected_pages:
             self.save_btn.config(state="normal", bg="#34C759")
+            self.delete_btn.config(state="normal", bg="#FF3B30")
         else:
             self.save_btn.config(state="disabled", bg="#CCCCCC")
+            self.delete_btn.config(state="disabled", bg="#CCCCCC")
+
+    def refresh_page_grid(self):
+        """現在の active_pages に基づいて、グリッド表示を再構築します"""
+        # 既存のページカードを破棄
+        for wd in self.page_widgets:
+            wd["frame"].destroy()
+        self.page_widgets.clear()
+        
+        tk_placeholder = self.photo_images.get(-1)
+        
+        for orig_idx in self.active_pages:
+            card_frame = tk.Frame(
+                self.scrollable_frame,
+                highlightbackground="#CCCCCC",
+                highlightcolor="#CCCCCC",
+                highlightthickness=2,
+                bd=0,
+                bg="#F5F5F5",
+                cursor="hand2"
+            )
+            
+            tk_img = self.photo_images.get(orig_idx, tk_placeholder)
+            img_lbl = tk.Label(card_frame, image=tk_img, bg="#F5F5F5")
+            img_lbl.pack(padx=8, pady=8)
+            
+            txt_lbl = tk.Label(
+                card_frame, text=f"Page {orig_idx + 1}", bg="#F5F5F5", fg="#333333", font=("Arial", 10, "bold")
+            )
+            txt_lbl.pack(padx=8, pady=(0, 8))
+            
+            # 各要素へのクリックバインド
+            for widget in (card_frame, img_lbl, txt_lbl):
+                widget.bind("<Button-1>", lambda event, o_idx=orig_idx: self.toggle_page_selection(o_idx))
+            
+            self.page_widgets.append({
+                "frame": card_frame,
+                "img_lbl": img_lbl,
+                "txt_lbl": txt_lbl,
+                "orig_idx": orig_idx
+            })
+            
+            self.update_card_visual(orig_idx)
+            
+        self.update_grid_layout()
+
+    def delete_selected_pages(self):
+        """選択されたページを画面の表示（編集対象）から削除します"""
+        if not self.selected_pages:
+            return
+            
+        num_selected = len(self.selected_pages)
+        if not messagebox.askyesno(
+            "確認", 
+            f"選択した {num_selected} ページを削除しますか？\n（元のPDFファイルは変更されません）"
+        ):
+            return
+            
+        # active_pages から選択されたページを除外
+        self.active_pages = [p for p in self.active_pages if p not in self.selected_pages]
+        self.selected_pages.clear()
+        
+        self.refresh_page_grid()
+        self.update_button_states()
+        self.update_status_label()
+        
+        # すべて削除されてしまった場合の処理
+        if not self.active_pages:
+            self.select_all_btn.config(state="disabled")
+            self.clear_btn.config(state="disabled")
+            self.status_label.config(text="すべてのページが削除されました。新しいPDFファイルを開いてください。")
 
     def update_status_label(self):
         """ステータスラベルのテキストを更新します"""
