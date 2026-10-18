@@ -44,7 +44,10 @@ class PDFSplitterApp:
         self.queue = queue.Queue()
         self.stop_event = threading.Event()
         self.render_thread = None
-        
+        self.render_generation = 0    # 古いスレッドからの結果を判別するための世代番号
+        self.is_loading = False       # サムネイル生成中かどうか
+        self.loaded_count = 0         # 生成済みサムネイル数
+
         # プレースホルダー画像の作成
         self.placeholder_image = self.create_placeholder_image()
         
@@ -290,17 +293,20 @@ class PDFSplitterApp:
         self.update_button_states()
         filename = os.path.basename(file_path)
         self.status_label.config(text=f"読込中: {filename} (全 {num_pages} ページ)")
-        
+
         # サムネイル生成用の新規スレッドを開始
+        self.render_generation += 1
+        self.is_loading = True
+        self.loaded_count = 0
         self.stop_event = threading.Event()
         self.render_thread = threading.Thread(
             target=self.render_thumbnails_worker,
-            args=(file_path, self.stop_event)
+            args=(file_path, self.stop_event, self.render_generation)
         )
         self.render_thread.daemon = True
         self.render_thread.start()
 
-    def render_thumbnails_worker(self, pdf_path, stop_event):
+    def render_thumbnails_worker(self, pdf_path, stop_event, generation):
         """別スレッドでPDFページをレンダリングし、画像を生成するワーカー"""
         try:
             doc = fitz.open(pdf_path)
@@ -318,11 +324,12 @@ class PDFSplitterApp:
                 img.thumbnail((140, 180), Image.LANCZOS)
                 
                 # 生成した画像をキューにプッシュ
-                self.queue.put((i, img))
-                
+                self.queue.put(("page", generation, i, img))
+
             doc.close()
+            self.queue.put(("done", generation))
         except Exception as e:
-            self.queue.put(("error", str(e)))
+            self.queue.put(("error", generation, str(e)))
 
     def poll_queue(self):
         """キューから読み込み完了した画像を定期的に取得し、UIに反映します (メインスレッドで実行)"""
@@ -330,34 +337,42 @@ class PDFSplitterApp:
             while True:
                 # ブロックせずにキューから要素を取得
                 item = self.queue.get_nowait()
-                
-                if item[0] == "error":
+                kind, generation = item[0], item[1]
+
+                # 以前に開いたPDFの結果は破棄
+                if generation != self.render_generation:
+                    self.queue.task_done()
+                    continue
+
+                if kind == "error":
                     # エラー発生時の処理
-                    messagebox.showerror("レンダリングエラー", f"サムネイル生成中にエラーが発生しました:\n{item[1]}")
+                    self.is_loading = False
+                    messagebox.showerror("レンダリングエラー", f"サムネイル生成中にエラーが発生しました:\n{item[2]}")
+                    self.update_status_label()
+                elif kind == "done":
+                    self.is_loading = False
+                    self.update_status_label()
                 else:
-                    idx, img = item
+                    idx, img = item[2], item[3]
                     tk_img = ImageTk.PhotoImage(img)
                     self.photo_images[idx] = tk_img  # ガベージコレクション防止
-                    
+                    self.loaded_count += 1
+
                     # ウィジェットの画像を更新
                     for wd in self.page_widgets:
                         if wd.get("orig_idx") == idx:
                             wd["img_lbl"].config(image=tk_img)
                             break
-                        
+
                 self.queue.task_done()
         except queue.Empty:
             pass
-        
-        # ロード完了後のステータス更新
-        if self.pdf_path:
-            loaded_count = len(self.photo_images) - 1  # プレースホルダー分を除く
-            if loaded_count < self.total_pages:
-                filename = os.path.basename(self.pdf_path)
-                self.status_label.config(text=f"読込中: {filename} ({loaded_count}/{self.total_pages} ページ完了)")
-            else:
-                self.update_status_label()
-                
+
+        # 読込中のみ進捗を表示（ページが残っていない場合は表示しない）
+        if self.pdf_path and self.is_loading and self.active_pages:
+            filename = os.path.basename(self.pdf_path)
+            self.status_label.config(text=f"読込中: {filename} ({self.loaded_count}/{self.total_pages} ページ完了)")
+
         # 100ms後に再確認
         self.root.after(100, self.poll_queue)
 
@@ -486,11 +501,12 @@ class PDFSplitterApp:
         if not self.active_pages:
             self.select_all_btn.config(state="disabled")
             self.clear_btn.config(state="disabled")
-            self.status_label.config(text="すべてのページが削除されました。新しいPDFファイルを開いてください。")
 
     def update_status_label(self):
         """ステータスラベルのテキストを更新します"""
-        if self.pdf_path:
+        if self.pdf_path and not self.active_pages:
+            self.status_label.config(text="すべてのページが削除されました。新しいPDFファイルを開いてください。")
+        elif self.pdf_path:
             total = len(self.page_widgets)
             selected = len(self.selected_pages)
             filename = os.path.basename(self.pdf_path)
